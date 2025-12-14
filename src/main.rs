@@ -1,4 +1,6 @@
 use eframe::egui;
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::thread;
 
 pub trait Simulation {
     fn name(&self) -> &str;
@@ -9,12 +11,76 @@ pub trait Simulation {
 }
 
 pub struct NoSim;
+
 impl Simulation for NoSim {
     fn name(&self) -> &str { "None" }
     fn update(&mut self) {}
     fn reset(&mut self) {}
     fn ui(&mut self, ui: &mut egui::Ui) { ui.label("No simulation selected."); }
     fn render(&self, buffer: &mut Vec<u8>) { buffer.fill(0); }
+}
+
+pub struct AsyncSim<T: Send + 'static + Default> {
+    name: String,
+    state: T,
+    receiver: Option<Receiver<T>>,
+    spawner: Box<dyn Fn(Sender<T>) + Send + Sync>,
+    renderer: Box<dyn Fn(&T, &mut Vec<u8>) + Send + Sync>,
+    ui_draw: Box<dyn Fn(&T, &mut egui::Ui) + Send + Sync>,
+}
+
+impl<T: Send + 'static + Default> AsyncSim<T> {
+    pub fn new(
+        name: &str,
+        spawner: impl Fn(Sender<T>) + Send + Sync + 'static,
+        renderer: impl Fn(&T, &mut Vec<u8>) + Send + Sync + 'static,
+        ui_draw: impl Fn(&T, &mut egui::Ui) + Send + Sync + 'static,
+    ) -> Self {
+        let mut sim = Self {
+            name: name.to_owned(),
+            state: T::default(),
+            receiver: None,
+            spawner: Box::new(spawner),
+            renderer: Box::new(renderer),
+            ui_draw: Box::new(ui_draw),
+        };
+        sim.reset();
+        sim
+    }
+}
+
+impl<T: Send + 'static + Default> Simulation for AsyncSim<T> {
+    fn name(&self) -> &str { &self.name }
+
+    fn update(&mut self) {
+        if let Some(rx) = &self.receiver {
+            loop {
+                match rx.try_recv() {
+                    Ok(new_state) => self.state = new_state,
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        self.receiver = None;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        let (tx, rx) = channel();
+        self.receiver = Some(rx);
+        self.state = T::default();
+        (self.spawner)(tx);
+    }
+
+    fn render(&self, buffer: &mut Vec<u8>) {
+        (self.renderer)(&self.state, buffer);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        (self.ui_draw)(&self.state, ui);
+    }
 }
 
 struct App {
